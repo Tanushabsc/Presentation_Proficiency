@@ -218,7 +218,7 @@ async function extractPptx(file) {
 
     const texts = [
 
-      ...xml.matchAll(/<a:t>([\s\S]*-)<\/a:t>/g)
+      ...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)
 
     ].map(match =>
 
@@ -1739,7 +1739,7 @@ function App() {
 
                   />
 
-                  <span>ï¼‹ Upload PPTX / PDF</span>
+                  <span>Upload PPTX / PDF</span>
 
                 </label>
 
@@ -2262,6 +2262,45 @@ function App() {
                   <button className="primary" onClick={saveSlideEdits}>Save Edits</button>
                   <button className="outline" onClick={() => { saveSlideEdits(); setPage('practice'); }}>Save & Move to Practice</button>
                 </div>
+
+                {(() => {
+                  const item = analysis?.slideDetails?.find(d => d.slide === currentSlide + 1) || analysis?.slideDetails?.[currentSlide];
+                  const suggestions = item?.suggestions || [];
+                  return (
+                    <div style={{ marginTop: 24, padding: 18, borderRadius: 14, border: '1px solid #dcecea', background: '#f7fbfa' }}>
+                      <div className="sectionTitleRow" style={{ marginBottom: 12, alignItems: 'flex-start' }}>
+                        <div>
+                          <h4 style={{ margin: 0 }}>Suggested edits for this slide</h4>
+                          <p className="support" style={{ margin: '6px 0 0' }}>
+                            {item ? 'Based on the slide analysis, here are specific improvements you can make to this slide.' : 'Run Slide Analysis to get slide-specific edit suggestions here.'}
+                          </p>
+                        </div>
+                        {item?.density && <span className={item.density === 'High' ? 'tagWarning' : 'tagNeutral'}>{item.density} density</span>}
+                      </div>
+                      {item?.keyTerms?.length ? (
+                        <p style={{ margin: '0 0 12px', color: '#0f766e' }}><strong>Key terms detected:</strong> {item.keyTerms.join(', ')}</p>
+                      ) : null}
+                      {suggestions.length ? (
+                        <div style={{ display: 'grid', gap: 12 }}>
+                          {suggestions.map((s, index) => (
+                            <div key={index} style={{ padding: 14, borderRadius: 12, border: '1px solid #e4ecea', background: s.priority === 'High' ? '#fff8f6' : s.priority === 'Good' ? '#f4fbf8' : '#ffffff' }}>
+                              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center', marginBottom: 8 }}>
+                                <span className={s.priority === 'High' ? 'tagWarning' : 'tagNeutral'}>{s.priority}</span>
+                                <strong style={{ fontSize: 14, color: '#1f3f46' }}>{s.area}</strong>
+                              </div>
+                              <p style={{ margin: '0 0 8px', color: '#334155' }}><strong>Issue:</strong> {s.issue}</p>
+                              {s.why && <p style={{ margin: '0 0 8px' }}><strong>Why it matters:</strong> {s.why}</p>}
+                              <p style={{ margin: '0 0 8px' }}><strong>What to change:</strong> {s.action}</p>
+                              {s.example && <p style={{ margin: 0, color: '#0f766e' }}><strong>Example:</strong> {s.example}</p>}
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="support" style={{ margin: 0 }}>No analysis suggestions available for this slide yet.</p>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <div style={{ marginTop: 24 }}>
                   <h4 style={{ margin: '0 0 10px' }}>All slides</h4>
