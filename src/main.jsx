@@ -9,17 +9,20 @@ import { FaceLandmarker, FilesetResolver, GestureRecognizer, PoseLandmarker } fr
 
 import JSZip from 'jszip';
 import PptxGenJS from 'pptxgenjs';
-import { PptxRenderer } from 'pptx-browser';
+import {
+  PptxViewer,
+  RECOMMENDED_ZIP_LIMITS
+} from '@aiden0z/pptx-renderer';
 import { CartesianGrid, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 
 import './styles.css';
 
 
 
-pdfjsLib.GlobalWorkerOptions.workerSrc =
-
-  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
-
+pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
+  'pdfjs-dist/build/pdf.worker.min.mjs',
+  import.meta.url
+).toString();
 
 
 const fillers = [
@@ -195,84 +198,86 @@ async function extractPdf(file) {
 
 
 async function extractPptx(file) {
-
   const buffer = await file.arrayBuffer();
-
   const zip = await JSZip.loadAsync(buffer);
 
-
-
   const names = Object.keys(zip.files)
-
     .filter(name => /^ppt\/slides\/slide\d+\.xml$/.test(name))
-
-    .sort((a, b) => {
-
-      const numberA = Number(a.match(/slide(\d+)/)[1]);
-
-      const numberB = Number(b.match(/slide(\d+)/)[1]);
-
-      return numberA - numberB;
-
-    });
-
-
+    .sort(
+      (a, b) =>
+        Number(a.match(/slide(\d+)/)[1]) -
+        Number(b.match(/slide(\d+)/)[1])
+    );
 
   const slides = [];
 
-
-
   for (const name of names) {
-
     const xml = await zip.file(name).async('text');
 
-
-
-    const texts = [
-
-      ...xml.matchAll(/<a:t>([\s\S]*?)<\/a:t>/g)
-
-    ].map(match =>
-
-      match[1]
-
-        .replace(/&amp;/g, '&')
-
-        .replace(/&lt;/g, '<')
-
-        .replace(/&gt;/g, '>')
-
-        .replace(/&quot;/g, '"')
-
-        .replace(/&apos;/g, "'")
-
+    const doc = new DOMParser().parseFromString(
+      xml,
+      'application/xml'
     );
 
-    const fontSizes = [...xml.matchAll(/<a:rPr[^>]*\ssz="(\d+)"/g)].map(m => Number(m[1]) / 100).filter(n => n > 0);
-    const images = (xml.match(/<p:pic\b/g) || []).length + (xml.match(/<a:blip\b/g) || []).length;
-    const bullets = (xml.match(/<a:buChar\b|<a:buAutoNum\b|<a:buBlip\b/g) || []).length;
+    if (doc.getElementsByTagName('parsererror').length) {
+      throw new Error(`Unable to read ${name}`);
+    }
+
+    // Keep every paragraph separate instead of flattening
+    // the complete slide into one text string.
+    const paragraphs = Array.from(
+      doc.getElementsByTagNameNS('*', 'p')
+    );
+
+    const texts = paragraphs.map(paragraph =>
+      Array.from(
+        paragraph.getElementsByTagNameNS('*', 't')
+      )
+        .map(node => node.textContent || '')
+        .join('')
+    );
+
+    const fontSizes = [
+      ...xml.matchAll(/<a:rPr[^>]*\ssz="(\d+)"/g)
+    ]
+      .map(m => Number(m[1]) / 100)
+      .filter(n => n > 0);
+
+    const images =
+      (xml.match(/<p:pic\b/g) || []).length +
+      (xml.match(/<a:blip\b/g) || []).length;
+
+    const bullets = (
+      xml.match(/<a:buChar\b|<a:buAutoNum\b|<a:buBlip\b/g) || []
+    ).length;
+
     const shapes = (xml.match(/<p:sp\b/g) || []).length;
     const textBoxes = (xml.match(/<p:txBody>/g) || []).length;
 
     slides.push({
-      text: texts.join(' '),
+      text: texts.join('\n'),
       meta: {
         images,
         bullets,
         shapes,
         textBoxes,
-        minFontPt: fontSizes.length ? Math.min(...fontSizes) : null,
-        maxFontPt: fontSizes.length ? Math.max(...fontSizes) : null,
-        avgFontPt: fontSizes.length ? Math.round(fontSizes.reduce((a,b)=>a+b,0) / fontSizes.length) : null
+        minFontPt: fontSizes.length
+          ? Math.min(...fontSizes)
+          : null,
+        maxFontPt: fontSizes.length
+          ? Math.max(...fontSizes)
+          : null,
+        avgFontPt: fontSizes.length
+          ? Math.round(
+              fontSizes.reduce((a, b) => a + b, 0) /
+              fontSizes.length
+            )
+          : null
       }
     });
-
   }
 
-
-
   return slides;
-
 }
 
 
@@ -432,6 +437,7 @@ function App() {
   const [recording, setRecording] = useState(false);
 
   const [transcript, setTranscript] = useState('');
+  const finalTranscriptRef = useRef('');
 
   const [seconds, setSeconds] = useState(0);
 
@@ -479,12 +485,15 @@ function App() {
 
 
   const videoRef = useRef(null);
-  const slideCanvasRef = useRef(null);
-  const editCanvasRef = useRef(null);
-  const pptxRendererRef = useRef(null);
-  const modifiedPptxRef = useRef(null);
-  const slideEditsRef = useRef([]);
-  const rebuildingRef = useRef(false);
+const slideCanvasRef = useRef(null);
+
+const pptxContainerRef = useRef(null);
+const pptxViewerRef = useRef(null);
+const pptxSourceRef = useRef(null);
+
+const modifiedPptxRef = useRef(null);
+const slideEditsRef = useRef([]);
+const rebuildingRef = useRef(false);
 
   const streamRef = useRef(null);
   const cameraStreamRef = useRef(null);
@@ -632,78 +641,127 @@ function App() {
 
 
 
-  // Load the uploaded PowerPoint into a browser-side renderer once per file.
-  useEffect(() => {
-    let cancelled = false;
-    let renderer = null;
-    async function loadPowerPoint() {
-      if (!file || !file.name.toLowerCase().endsWith('.pptx')) {
-        setPptxReady(false);
-        return;
-      }
-      setPptxReady(false);
-      setSlideRenderError('Loading PowerPoint slides...');
-      try {
-        renderer = new PptxRenderer();
-        await renderer.load(file);
-        if (cancelled) {
-          renderer.destroy();
-          return;
-        }
-        if (pptxRendererRef.current) pptxRendererRef.current.destroy();
-        pptxRendererRef.current = renderer;
-        setPptxReady(true);
-        setSlideRenderError('');
-      } catch (err) {
-        if (!cancelled) setSlideRenderError(`PowerPoint preview could not be loaded: ${err.message || err}`);
-      }
-    }
-    loadPowerPoint();
-    return () => {
-      cancelled = true;
-      if (renderer) {
-        if (pptxRendererRef.current === renderer) pptxRendererRef.current = null;
-        renderer.destroy();
-      }
-    };
-  }, [file]);
 
-  // Draw the selected original slide into the practice viewer (PPTX or PDF).
-  useEffect(() => {
-    let cancelled = false;
-    async function renderSelectedSlide() {
-      const canvas = page === 'edit' ? editCanvasRef.current : slideCanvasRef.current;
-      if (!['practice', 'edit'].includes(page) || !file || !canvas) return;
-      try {
-        if (file.name.toLowerCase().endsWith('.pptx')) {
-          if (!pptxReady || !pptxRendererRef.current) return;
-          await pptxRendererRef.current.renderSlide(currentSlide, canvas, 1440);
-          try {
-            const ctx = canvas.getContext('2d', { willReadFrequently: true });
-            const { width: w, height: h } = canvas;
-            const pts = [[10,10],[w/2,h/2],[w-10,10],[10,h-10],[w/2,h/4],[w/2,3*h/4],[w/4,h/2],[3*w/4,h/2]];
-            const blank = w > 0 && pts.every(([x,y]) => { const d = ctx.getImageData(Math.floor(x),Math.floor(y),1,1).data; return d[3] === 0 || (d[0] > 250 && d[1] > 250 && d[2] > 250); });
-            if (!cancelled) { setSlidePreviewBlank(blank); setSlideRenderError(blank ? 'Exact PPT preview unavailable for this slide in browser; showing editable content preview.' : ''); }
-          } catch (_) { if (!cancelled) { setSlidePreviewBlank(false); setSlideRenderError(''); } }
-        } else if (file.name.toLowerCase().endsWith('.pdf')) {
-          if (!cancelled) setSlidePreviewBlank(false);
-          const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
-          if (cancelled) return;
-          const pdfPage = await pdf.getPage(currentSlide + 1);
-          if (cancelled) return;
-          const context = canvas.getContext('2d');
-          const viewport = pdfPage.getViewport({ scale: 1.5 });
-          canvas.width = viewport.width;
-          canvas.height = viewport.height;
-          await pdfPage.render({ canvasContext: context, viewport }).promise;
+// Clean up the previous PPTX viewer when the uploaded file changes.
+useEffect(() => {
+  return () => {
+    if (pptxViewerRef.current) {
+      pptxViewerRef.current.destroy();
+      pptxViewerRef.current = null;
+      pptxSourceRef.current = null;
+    }
+  };
+}, [file]);
+
+// Render the selected PPTX or PDF slide.
+useEffect(() => {
+  let cancelled = false;
+
+  async function renderSelectedSlide() {
+    if (page !== 'practice' || !file) return;
+
+    try {
+      if (file.name.toLowerCase().endsWith('.pptx')) {
+        const container = pptxContainerRef.current;
+
+        if (!container) return;
+
+        let viewer = pptxViewerRef.current;
+
+        // Create the viewer or load a newly uploaded PPTX.
+        if (!viewer || pptxSourceRef.current !== file) {
+          if (viewer) {
+            viewer.destroy();
+          }
+
+          pptxViewerRef.current = null;
+          pptxSourceRef.current = null;
+
+          setPptxReady(false);
+          setSlideRenderError('Loading PowerPoint slides...');
+
+          viewer = await PptxViewer.open(
+            await file.arrayBuffer(),
+            container,
+            {
+              renderMode: 'slide',
+              fitMode: 'contain',
+              zipLimits: RECOMMENDED_ZIP_LIMITS,
+              externalMedia: 'block'
+            }
+          );
+
+          if (cancelled) {
+            viewer.destroy();
+            return;
+          }
+
+          pptxViewerRef.current = viewer;
+          pptxSourceRef.current = file;
         }
-      } catch (err) {
-        if (!cancelled) setSlideRenderError(`Slide ${currentSlide + 1} could not be displayed: ${err.message || err}`);
+
+        await viewer.renderSlide(currentSlide);
+
+        if (cancelled) return;
+
+        setPptxReady(true);
+        setSlidePreviewBlank(false);
+        setSlideRenderError('');
+
+      } else if (file.name.toLowerCase().endsWith('.pdf')) {
+        const canvas = slideCanvasRef.current;
+
+        if (!canvas) return;
+
+        const pdf = await pdfjsLib.getDocument({
+          data: await file.arrayBuffer()
+        }).promise;
+
+        if (cancelled) return;
+
+        const pdfPage = await pdf.getPage(currentSlide + 1);
+
+        if (cancelled) return;
+
+        const viewport = pdfPage.getViewport({ scale: 1.5 });
+        const context = canvas.getContext('2d');
+
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+
+        await pdfPage.render({
+          canvasContext: context,
+          viewport
+        }).promise;
+
+        if (cancelled) return;
+
+        setSlidePreviewBlank(false);
+        setSlideRenderError('');
+      }
+
+    } catch (err) {
+      if (!cancelled) {
+        console.error('Slide rendering error:', err);
+
+        setPptxReady(false);
+        setSlideRenderError(
+          `Slide ${currentSlide + 1} could not be displayed: ${
+            err.message || err
+          }`
+        );
       }
     }
-    renderSelectedSlide();
-    return () => { cancelled = true; };
-  }, [page, file, currentSlide, pptxReady, previewVersion]);
+  }
+
+  renderSelectedSlide();
+
+  return () => {
+    cancelled = true;
+  };
+
+}, [page, file, currentSlide, previewVersion]);
+
 
   useEffect(() => {
     if (page !== 'edit' || !slideEdits.length) return;
@@ -967,6 +1025,8 @@ function App() {
 
   async function startMicrophone() {
     setError('');
+    // Preserve any transcript already present when a new recording starts.
+    finalTranscriptRef.current = transcript.trim();
     if (!navigator.mediaDevices?.getUserMedia) {
       setMicMessage('Microphone access requires HTTPS or localhost and a supported browser.');
       return;
@@ -1012,14 +1072,32 @@ function App() {
         recognition.interimResults = true;
         recognition.lang = 'en-IN';
         recognition.onresult = event => {
-          let finalText = '';
           let interimText = '';
-          for (let i = 0; i < event.results.length; i++) {
-            const phrase = event.results[i][0].transcript;
-            if (event.results[i].isFinal) finalText += `${phrase} `;
-            else interimText += `${phrase} `;
+
+          // Process only results changed by this event. Final results are
+          // accumulated separately so a recognition restart cannot erase them.
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const result = event.results[i];
+            const phrase = result[0]?.transcript?.trim();
+
+            if (!phrase) continue;
+
+            if (result.isFinal) {
+              finalTranscriptRef.current = [
+                finalTranscriptRef.current,
+                phrase
+              ].filter(Boolean).join(' ');
+            } else {
+              interimText += `${phrase} `;
+            }
           }
-          setTranscript([finalText.trim(), interimText.trim()].filter(Boolean).join(' '));
+
+          const completeTranscript = [
+            finalTranscriptRef.current,
+            interimText.trim()
+          ].filter(Boolean).join(' ');
+
+          setTranscript(completeTranscript);
         };
         recognition.onerror = event => {
           const messages = {
@@ -1167,7 +1245,10 @@ function App() {
       const res = await fetch('http://127.0.0.1:8011/transcribe', { method: 'POST', body: form });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Transcription failed.');
-      if (data.transcript) setTranscript(data.transcript);
+      if (data.transcript) {
+        setTranscript(data.transcript);
+        finalTranscriptRef.current = data.transcript;
+      }
       if (Array.isArray(data.segments) && data.segments.length) {
         // simple pause estimate from whisper segment gaps
         const gaps = [];
@@ -1416,71 +1497,133 @@ function App() {
 
 
   async function buildEditedPptxBlob() {
-    if (!file || !file.name.toLowerCase().endsWith('.pptx')) return null;
-    const buffer = await file.arrayBuffer();
-    const zip = await JSZip.loadAsync(buffer);
-    const names = Object.keys(zip.files)
-      .filter(name => /^ppt\/slides\/slide\d+\.xml$/.test(name))
-      .sort((a, b) => Number(a.match(/slide(\d+)/)[1]) - Number(b.match(/slide(\d+)/)[1]));
+  if (!file || !file.name.toLowerCase().endsWith('.pptx')) {
+    return null;
+  }
 
-    for (let i = 0; i < names.length; i++) {
-      const name = names[i];
-      let xml = await zip.file(name).async('text');
-      const currentEdits = slideEditsRef.current;
-      const edited = String(currentEdits[i] ?? '').replace(/\r\n/g, '\n');
-      const lines = edited.split('\n').map(l => l.trim()).filter(Boolean);
-      const doc = new DOMParser().parseFromString(xml, 'application/xml');
-      const paras = Array.from(doc.getElementsByTagNameNS('*', 'p'));
-      // only paragraph elements inside txBody; filter by localName p and having a:r or a:endParaR or parent txBody
-      const textParas = paras.filter(p => p.localName === 'p' && (p.getElementsByTagNameNS('*', 't').length > 0 || p.parentNode?.localName === 'txBody'));
-      const escapeXml = (str) => String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+  const buffer = await file.arrayBuffer();
+  const zip = await JSZip.loadAsync(buffer);
 
-      if (textParas.length) {
-        for (let pi = 0; pi < textParas.length; pi++) {
-          const para = textParas[pi];
-          const tNodes = Array.from(para.getElementsByTagNameNS('*', 't'));
-          const line = lines[pi] ?? (pi === textParas.length - 1 && lines.length > textParas.length ? lines.slice(pi).join(' ') : '');
-          if (tNodes.length === 0) {
-            // create a run if needed
-            if (line) {
-              const nsA = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-              const r = doc.createElementNS(nsA, 'a:r');
-              const t = doc.createElementNS(nsA, 'a:t');
-              t.textContent = line;
-              r.appendChild(t);
-              para.appendChild(r);
-            }
-          } else {
-            tNodes[0].textContent = line;
-            for (let ti = 1; ti < tNodes.length; ti++) tNodes[ti].textContent = '';
-          }
+  const names = Object.keys(zip.files)
+    .filter(name => /^ppt\/slides\/slide\d+\.xml$/.test(name))
+    .sort(
+      (a, b) =>
+        Number(a.match(/slide(\d+)/)[1]) -
+        Number(b.match(/slide(\d+)/)[1])
+    );
+
+  const A_NS =
+    'http://schemas.openxmlformats.org/drawingml/2006/main';
+
+  const currentEdits = slideEditsRef.current;
+
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+
+    const xml = await zip.file(name).async('text');
+
+    const edited = String(currentEdits[i] ?? '')
+      .replace(/\r\n/g, '\n');
+
+    // Preserve paragraph boundaries, including empty lines.
+    const lines = edited
+      .split('\n')
+      .map(line => line.trim());
+
+    const doc = new DOMParser().parseFromString(
+      xml,
+      'application/xml'
+    );
+
+    if (doc.getElementsByTagName('parsererror').length) {
+      throw new Error(`Unable to update ${name}`);
+    }
+
+    let paragraphs = Array.from(
+      doc.getElementsByTagNameNS(A_NS, 'p')
+    );
+
+    if (!paragraphs.length) continue;
+
+    // Add paragraphs when the edited content has more
+    // lines than the original slide.
+    while (paragraphs.length < lines.length) {
+      const lastParagraph = paragraphs[paragraphs.length - 1];
+
+      const clone = lastParagraph.cloneNode(true);
+
+      const clonedTextNodes = Array.from(
+        clone.getElementsByTagNameNS(A_NS, 't')
+      );
+
+      clonedTextNodes.forEach(node => {
+        node.textContent = '';
+      });
+
+      lastParagraph.parentNode.insertBefore(
+        clone,
+        lastParagraph.nextSibling
+      );
+
+      paragraphs.push(clone);
+    }
+
+    // Update the existing paragraphs without replacing
+    // their paragraph properties or text-box shapes.
+    paragraphs.forEach((paragraph, index) => {
+      const line = lines[index] ?? '';
+
+      const textNodes = Array.from(
+        paragraph.getElementsByTagNameNS(A_NS, 't')
+      );
+
+      if (textNodes.length > 0) {
+        // Keep the first run's original formatting.
+        textNodes[0].textContent = line;
+
+        // Clear duplicate runs without deleting their
+        // original formatting structures.
+        for (let j = 1; j < textNodes.length; j++) {
+          textNodes[j].textContent = '';
         }
-      } else if (lines.length) {
-        // no existing text paragraphs; try to put into first txBody
-        const txBodies = Array.from(doc.getElementsByTagNameNS('*', 'txBody'));
-        if (txBodies.length) {
-          const nsA = 'http://schemas.openxmlformats.org/drawingml/2006/main';
-          const tx = txBodies[0];
-          // remove existing p children
-          Array.from(tx.childNodes).forEach(n => { if (n.localName === 'p') tx.removeChild(n); });
-          lines.forEach(line => {
-            const pEl = doc.createElementNS(nsA, 'a:p');
-            const r = doc.createElementNS(nsA, 'a:r');
-            const t = doc.createElementNS(nsA, 'a:t');
-            t.textContent = line;
-            r.appendChild(t); pEl.appendChild(r); tx.appendChild(pEl);
-          });
+      } else if (line) {
+        // Create a text run only if the paragraph
+        // originally had no text.
+        const run = doc.createElementNS(A_NS, 'a:r');
+        const textNode = doc.createElementNS(A_NS, 'a:t');
+
+        textNode.textContent = line;
+
+        run.appendChild(textNode);
+
+        const endRun = Array.from(paragraph.childNodes)
+          .find(node => node.localName === 'endParaRPr');
+
+        if (endRun) {
+          paragraph.insertBefore(run, endRun);
+        } else {
+          paragraph.appendChild(run);
         }
       }
+    });
 
-      const serializer = new XMLSerializer();
-      xml = serializer.serializeToString(doc);
-      zip.file(name, xml);
-    }
-    const out = await zip.generateAsync({ type: 'blob', mimeType: 'application/vnd.openxmlformats-officedocument.presentationml.presentation' });
-    modifiedPptxRef.current = out;
-    return out;
+    const serializer = new XMLSerializer();
+
+    const updatedXml = serializer.serializeToString(doc);
+
+    zip.file(name, updatedXml);
   }
+
+  const output = await zip.generateAsync({
+    type: 'blob',
+    mimeType:
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  });
+
+  modifiedPptxRef.current = output;
+
+  return output;
+}
 
   async function saveSlideEdits({ silent = false } = {}) {
     const cleaned = (slideEditsRef.current.length ? slideEditsRef.current : slideEdits).map(s => String(s || '').trim());
@@ -1495,12 +1638,25 @@ function App() {
         const blob = await buildEditedPptxBlob();
         if (blob) {
           setPptxReady(false);
-          if (pptxRendererRef.current) { pptxRendererRef.current.destroy(); pptxRendererRef.current = null; }
-          const renderer = new PptxRenderer();
-          await renderer.load(blob);
-          pptxRendererRef.current = renderer;
-          setPptxReady(true);
-          setPreviewVersion(v => v + 1);
+
+if (pptxViewerRef.current) {
+  pptxViewerRef.current.destroy();
+  pptxViewerRef.current = null;
+}
+
+pptxSourceRef.current = null;
+
+// Update the working PPTX file with the saved edits.
+const updatedFile = new File(
+  [blob],
+  file.name,
+  {
+    type: 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+  }
+);
+
+setFile(updatedFile);
+setPreviewVersion(v => v + 1);
         }
       } catch (err) {
         console.error(err);
@@ -1734,7 +1890,7 @@ function App() {
 
                 <p>
 
-                  Upload presentation -> Analyze slides -> Get improvement suggestions -> Edit slides -> Practice with camera/microphone -> Analyze delivery -> Get final score and personalized feedback.
+                  Upload presentation → Analyze slides → Get improvement suggestions → Edit slides → Practice with camera/microphone → Analyze delivery → Get final score and personalized feedback.
 
                 </p>
 
@@ -2069,44 +2225,79 @@ function App() {
                   </div>
                   {file && slides.length > 0 && <span className="slidePosition">Slide {currentSlide + 1} / {slides.length}</span>}
                 </div>
-                {file && slides.length > 0 ? (
-                  (file.name.toLowerCase().endsWith('.pptx') && !slidePreviewBlank) || file.name.toLowerCase().endsWith('.pdf') ? (
-                    <div className="originalSlideStage">
-                      <canvas ref={slideCanvasRef} className="originalSlideCanvas" aria-label={`Presentation slide ${currentSlide + 1}`} />
-                      {file.name.toLowerCase().endsWith('.pptx') && !pptxReady && <div className="slideRenderNotice">Loading PPT preview...</div>}
-                      {slideRenderError && <div className="slideRenderNotice">{slideRenderError}</div>}
-                    </div>
-                  ) : (
-                    <div className="originalSlideStage" style={{ background: '#fff' }}>
-                      {(() => {
-                        const text = String(slides[currentSlide] || '');
-                        const lines = text.split(/\n+/).map(l => l.trim()).filter(Boolean);
-                        const title = lines[0] || `Slide ${currentSlide + 1}`;
-                        const body = lines.slice(1);
-                        return (
-                          <div style={{ width: '100%', height: '100%', padding: '8% 9%', display: 'flex', flexDirection: 'column', background: 'linear-gradient(180deg,#ffffff 0%,#f7fbfa 100%)', color: '#1f2937', overflow: 'auto' }}>
-                            <div style={{ fontSize: 'clamp(24px,3vw,42px)', fontWeight: 800, lineHeight: 1.15, color: '#134e4a', marginBottom: 24, fontFamily: 'Plus Jakarta Sans, Inter, sans-serif' }}>{title}</div>
-                            <div style={{ display: 'grid', gap: 12, fontSize: 'clamp(14px,1.6vw,22px)', lineHeight: 1.5 }}>
-                              {body.length ? body.map((line, i) => (
-                                <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'flex-start' }}>
-                                  <span style={{ color: '#0f766e', fontWeight: 700, lineHeight: 1.4 }}>*</span>
-                                  <span>{line.replace(/^[-**]\s*/, '')}</span>
-                                </div>
-                              )) : <div style={{ color: '#64748b' }}>No additional content on this slide.</div>}
-                            </div>
-                          </div>
-                        );
-                      })()}
-                        {slideRenderError && <div className="slideRenderNotice" style={{marginTop:8}}>{slideRenderError}</div>}
-                    </div>
-                  )
+                
+{file && slides.length > 0 ? (
+                  <div
+                    className="originalSlideStage"
+                    style={{
+                      width: '100%',
+                      aspectRatio: '16 / 9',
+                      minHeight: 220,
+                      maxHeight: 'min(62vh, 620px)',
+                      position: 'relative',
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      overflow: 'hidden',
+                      background: '#f8fafc',
+                      border: '1px solid #dbe4ee',
+                      borderRadius: 10
+                    }}
+                  >
+                    {file.name.toLowerCase().endsWith('.pptx') ? (
+                      <div
+                        ref={pptxContainerRef}
+                        className="pptxSlideViewport"
+                        style={{
+                          width: '100%',
+                          height: '100%',
+                          minHeight: 0,
+                          overflow: 'hidden'
+                        }}
+                      />
+                    ) : (
+                      <canvas
+                        ref={slideCanvasRef}
+                        className="originalSlideCanvas"
+                        aria-label={`Presentation slide ${currentSlide + 1}`}
+                        style={{
+                          display: 'block',
+                          maxWidth: '100%',
+                          maxHeight: '100%',
+                          width: 'auto',
+                          height: 'auto',
+                          objectFit: 'contain'
+                        }}
+                      />
+                    )}
+
+                    {file.name.toLowerCase().endsWith('.pptx') && !pptxReady && (
+                      <div className="slideRenderNotice" role="status">
+                        {slideRenderError || 'Loading PowerPoint preview...'}
+                      </div>
+                    )}
+
+                    {slideRenderError && pptxReady && (
+                      <div className="slideRenderNotice" role="alert">
+                        {slideRenderError}
+                      </div>
+                    )}
+                  </div>
                 ) : (
                   <div className="slideEmptyState">
                     <strong>No presentation loaded</strong>
-                    <span>Go to Slide Analysis and upload your .pptx or .pdf file first.</span>
-                    <button className="outline" onClick={() => setPage('analysis')}>Open Slide Analysis</button>
+                    <span>
+                      Go to Slide Analysis and upload your .pptx or .pdf file first.
+                    </span>
+                    <button
+                      className="outline"
+                      onClick={() => setPage('analysis')}
+                    >
+                      Open Slide Analysis
+                    </button>
                   </div>
                 )}
+
                 <div className="slideNavControls">
                   <button className="outline" disabled={!slides.length || currentSlide <= 0} onClick={() => setCurrentSlide(value => Math.max(0, value - 1))}>&larr; Previous</button>
                   <button className="outline" disabled={!slides.length || currentSlide >= slides.length - 1} onClick={() => setCurrentSlide(value => Math.min(slides.length - 1, value + 1))}>Next &rarr;</button>
@@ -2153,7 +2344,16 @@ function App() {
                     <div><h3>Live transcript</h3><p>Speech recognition fills this area when supported. You can also correct or type the transcript manually.</p></div>
                     <button className="outline" onClick={() => { setManualTranscript(transcript); setPage('alignment'); }}>Use for Slide Alignment</button>
                   </div>
-                  <textarea value={transcript} onChange={event => setTranscript(event.target.value)} placeholder="Your recognised speech appears here. If speech-to-text is unavailable, type what you presented..." rows={6} className="transcriptInput" />
+                  <textarea
+                    value={transcript}
+                    onChange={event => {
+                      setTranscript(event.target.value);
+                      finalTranscriptRef.current = event.target.value;
+                    }}
+                    placeholder="Your recognised speech appears here. If speech-to-text is unavailable, type what you presented..."
+                    rows={6}
+                    className="transcriptInput"
+                  />
                 </div>
               </div>
             </div>
