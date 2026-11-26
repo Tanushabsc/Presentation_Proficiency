@@ -159,19 +159,31 @@ async function extractPdf(file) {
 
 
   for (let i = 1; i <= pdf.numPages; i++) {
-
     const page = await pdf.getPage(i);
-
     const content = await page.getTextContent();
-
-
-
-    pages.push(
-
-      content.items.map(item => item.str).join(' ')
-
-    );
-
+    const items = (content.items || []).filter(item => typeof item.str === 'string' && item.str.trim());
+    let text = '';
+    let lastY = null;
+    let lastX = null;
+    for (const item of items) {
+      const str = item.str;
+      const tr = item.transform || [];
+      const x = typeof tr[4] === 'number' ? tr[4] : null;
+      const y = typeof tr[5] === 'number' ? tr[5] : null;
+      if (lastY !== null && y !== null && Math.abs(lastY - y) > 2) {
+        text += '\n';
+      } else if (text && !text.endsWith('\n') && !text.endsWith(' ')) {
+        // Add space between words on same line when there is a gap or no whitespace.
+        const gap = (lastX !== null && x !== null) ? (x - lastX) : 0;
+        if (gap > 1 || !/\s$/.test(text)) text += ' ';
+      }
+      text += str;
+      lastY = y;
+      // Approximate end x; width may be missing, so fall back to string length heuristic.
+      const w = typeof item.width === 'number' ? item.width : (str.length * 2);
+      lastX = (x !== null ? x + w : lastX);
+    }
+    pages.push(text.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim());
   }
 
 
@@ -278,8 +290,15 @@ function analyzeSlides(slidesInput) {
     const slideWords = countWords(clean);
     const lines = clean.split(/[\n*]+/).map(line => line.trim()).filter(Boolean);
     const sentences = (clean.match(/[.!-]+/g) || []).length;
-    const title = lines[0]?.slice(0, 90) || `Slide ${index + 1}`;
-    const excerpt = clean.length > 180 ? `${clean.slice(0, 177).trim()}...` : clean;
+    const titleRaw = lines[0] || `Slide ${index + 1}`;
+    const title = titleRaw.length > 140 ? `${titleRaw.slice(0, 140).replace(/\s+\S*$/, '').trim()}…` : titleRaw;
+    const excerpt = (() => {
+      if (clean.length <= 500) return clean;
+      const slice = clean.slice(0, 500);
+      const lastSentence = Math.max(slice.lastIndexOf('. '), slice.lastIndexOf('! '), slice.lastIndexOf('? '), slice.lastIndexOf('.\n'), slice.lastIndexOf('!\n'), slice.lastIndexOf('?\n'));
+      if (lastSentence > 120) return slice.slice(0, lastSentence + 1).trim();
+      return `${slice.replace(/\s+\S*$/, '').trim()}…`;
+    })();
     const keyTerms = [...new Set(tokenize(clean).filter(w => w.length > 4))].slice(0, 6);
     const bodyLines = lines.slice(1).filter(Boolean);
     const longLines = bodyLines.filter(l => countWords(l) > 18);
